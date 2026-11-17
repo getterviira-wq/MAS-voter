@@ -19,12 +19,13 @@ Build status:
     Step 8 – four parties + initial party         DONE
     Step 9 – data output (4 files)                DONE
     Step 10 – experiment runner (all CPU cores)   DONE
-    Step 11 – optional switches (bimodal: Role 4): TODO
+    Step 11 – bimodal start switch                DONE (final peak values: Role 4)
 
 How to run:
     python project-assignment-group-20.py             full experiment -> results/
     python project-assignment-group-20.py quick       small fast check -> results/quick/
     python project-assignment-group-20.py pilot       T = 1000 pilot to choose T -> results/pilot_T1000/
+    python project-assignment-group-20.py bimodal     extension: bimodal start, subset -> results/bimodal/
     python project-assignment-group-20.py test        all verification tests
 """
 
@@ -65,6 +66,12 @@ class Params:
     network_type: str = "small_world"  # "small_world" (main) or "complete" (verification)
     mean_degree: int = 6       # Watts–Strogatz: each voter linked to k nearest
     rewire_prob: float = 0.1   # Watts–Strogatz rewiring probability
+
+    # --- initial opinions (Step 11, extension, Teacher feedback point 1) ---
+    initial_dist: str = "uniform"      # "uniform" (main experiment) or "bimodal" (extension)
+    # PLACEHOLDER values: Role 4 chooses the final ones from the literature
+    bimodal_peaks: tuple = (0.35, 0.65)  # centre-left and centre-right peak
+    bimodal_sd: float = 0.1            # spread around each peak
 
     # --- voters (Step 3; computer trust from Step 5) ---
     s_min: float = 0.2         # susceptibility s_i ~ U(s_min, s_max)
@@ -228,13 +235,25 @@ def party_of(opinion, positions):
 
 
 def initial_opinion(model):
-    """Starting opinion of one voter: x_i ~ U(0, 1).     [Deffuant et al., 2000]
+    """Starting opinion of one voter.
 
-    This is the single place where starting opinions are made, so an
-    alternative start (e.g. the bimodal option, Role 4) only needs an
-    `if` here plus a setting in Params.
+    "uniform": x_i ~ U(0, 1)                             [Deffuant et al., 2000]
+    "bimodal": half the voters start near each peak      [OWN] Step 11 extension
+               (centre-left / centre-right, Teacher feedback point 1).
+               Each voter picks a peak at random, then x_i ~ N(peak, bimodal_sd).
+               Values outside [0, 1] are redrawn (not clipped), so no voters
+               pile up exactly at 0 or 1, even if a wider SD is chosen.
     """
-    return model.random.random()
+    params = model.params
+    if params.initial_dist == "uniform":
+        return model.random.random()
+    if params.initial_dist == "bimodal":
+        peak = model.random.choice(params.bimodal_peaks)
+        while True:
+            x = model.random.gauss(peak, params.bimodal_sd)
+            if 0.0 <= x <= 1.0:
+                return x
+    raise ValueError(f"unknown initial_dist: {params.initial_dist}")
 
 
 class Voter(Agent):
@@ -899,6 +918,44 @@ def test_step9_10():
     print("Parallel run identical to direct run.")
 
 
+def test_step11():
+    """Step 11 tests: bimodal start switch.                          [OWN]"""
+    print("\nStep 11 test – bimodal start")
+
+    # 1) default is still uniform (also guaranteed by the Step 4 test, which
+    #    reproduces the Step 3 results exactly)
+    assert TEST_PARAMS.initial_dist == "uniform"
+
+    # 2) bimodal: inside [0, 1], two groups around the peaks, few voters at 0.5
+    lo, hi = TEST_PARAMS.bimodal_peaks
+    xs = np.concatenate([
+        VoterModel(replace(TEST_PARAMS, initial_dist="bimodal", seed=s)).opinions()
+        for s in range(10)])                                   # 5,000 voters
+    left, right = xs[xs < 0.5], xs[xs >= 0.5]
+    near_middle = np.mean(np.abs(xs - 0.5) < 0.05)
+    near_peak = np.mean(np.abs(xs - lo) < 0.05)
+    print(f"Bimodal start (10 seeds): left group mean {left.mean():.3f} "
+          f"(peak {lo}), right group mean {right.mean():.3f} (peak {hi}), "
+          f"share left {len(left) / len(xs):.2f}")
+    # NOTE: whether there are fewer voters at the 0.5 party border than with a
+    # uniform start depends on the chosen peaks/SD, not on the code: with
+    # peaks 0.35/0.65 and SD 0.1 there are MORE (the two curves overlap at 0.5).
+    print(f"Share of voters within 0.05 of: 0.5 -> {near_middle:.3f}, "
+          f"peak {lo} -> {near_peak:.3f}  (uniform start: 0.100 everywhere)")
+    assert xs.min() >= 0 and xs.max() <= 1
+    assert abs(len(left) / len(xs) - 0.5) < 0.03
+    assert abs(left.mean() - lo) < 0.02 and abs(right.mean() - hi) < 0.02
+    assert near_middle < near_peak          # a dip between the two peaks
+
+    # 3) unknown setting gives a clear error
+    try:
+        VoterModel(replace(TEST_PARAMS, initial_dist="triangle"))
+        raise AssertionError("no error for unknown initial_dist")
+    except ValueError:
+        pass
+    print("Bimodal switch passed (bounds, two peaks, dip at 0.5, clear error).")
+
+
 def run_all_tests():
     test_deffuant_clusters()
     test_step3()
@@ -908,6 +965,7 @@ def run_all_tests():
     test_step7()
     test_step8()
     test_step9_10()
+    test_step11()
     print("\nAll tests passed.")
 
 
@@ -926,8 +984,16 @@ if __name__ == "__main__":
         # pilot equals tick t of a shorter run, so any T <= 1000 can be judged.
         run_experiment(replace(PARAMS, T=1000),
                        replace(EXPERIMENT, out_dir=os.path.join("results", "pilot_T1000")))
+    elif mode == "bimodal":
+        # extension (Step 11): bimodal start on a SUBSET of the grid, as agreed:
+        # p = 0 (baseline) and p = 0.5; tau_c0 = 0.5; e = 0.2, 0.3; b = 0, 0.15
+        # -> 2 + 1 x 1 x 2 x 2 = 6 conditions x 30 seeds = 180 runs
+        run_experiment(replace(PARAMS, initial_dist="bimodal"),
+                       replace(EXPERIMENT, p_values=(0.0, 0.5), tau_c0_values=(0.5,),
+                               e_values=(0.2, 0.3), b_values=(0.0, 0.15),
+                               out_dir=os.path.join("results", "bimodal")))
     elif mode == "experiment":
         run_experiment()
     else:
         print("Use: python project-assignment-group-20.py "
-              "[experiment | quick | pilot | test]")
+              "[experiment | quick | pilot | bimodal | test]")
