@@ -15,7 +15,9 @@ Build status:
     Step 4 – computer source (p, k)               DONE
     Step 5 – dynamic computer trust               DONE
     Step 6 – computer bias b                      DONE
-    Steps 7–11 – noise, parties, output, experiment, switches: TODO
+    Step 7 – noise sigma on human messages        DONE
+    Step 8 – four parties + initial party         DONE
+    Steps 9–11 – output, experiment, switches: TODO
 """
 
 import os
@@ -63,10 +65,11 @@ class Params:
     trust_up: float = 0.02     # trust gain after accepting computer message
     b: float = 0.0             # computer bias (misinformation)
 
-    # --- noise (later: Step 7) ---
+    # --- noise (Step 7) ---
     sigma: float = 0.05        # SD of Gaussian noise on human messages
 
-    # --- parties (later: Step 8) ---
+    # --- parties (Step 8) ---
+    # party 0 = left, 1 = centre-left, 2 = centre-right, 3 = right
     party_positions: tuple = (0.125, 0.375, 0.625, 0.875)
 
     # --- measures ---
@@ -174,6 +177,16 @@ def clip01(value):
     return min(max(value, 0.0), 1.0)
 
 
+def party_of(opinion, positions):
+    """Index of the party closest to this opinion.                 [OWN] Step 8
+
+    E.g. with positions (0.125, 0.375, 0.625, 0.875): 0.30 -> party 1.
+    On an exact tie (e.g. 0.25) the lower-numbered party wins.
+    """
+    distances = [abs(pos - opinion) for pos in positions]
+    return distances.index(min(distances))
+
+
 class Voter(Agent):
     """A voter in our extended model."""
 
@@ -187,10 +200,13 @@ class Voter(Agent):
         self.susceptibility = model.random.uniform(params.s_min, params.s_max)
         # personal computer trust, starts at tau_c0  # [OWN] Step 5
         self.computer_trust = params.tau_c0
+        # party: closest party; remember the start to measure switching  [OWN] Step 8
+        self.initial_party = party_of(self.opinion, params.party_positions)
+        self.party = self.initial_party
         self.neighbours = []                        # filled in by the model
 
     def step(self):
-        """One action of this voter in a tick (steps 1–4 of the tick in our proposal)."""
+        """One action of this voter in a tick (steps 1–5 of the tick in our proposal)."""
         params = self.model.params
 
         # 1) choose the information source                             [OWN] Step 4
@@ -204,7 +220,7 @@ class Voter(Agent):
             trust = self.computer_trust              # personal, changes over time
         else:
             partner = self.model.random.choice(self.neighbours)
-            message = partner.opinion                # noise sigma is added in Step 7
+            message = self.human_message(partner)    # opinion + noise (Step 7)
             trust = params.tau_h                     # fixed
 
         # 3) bounded confidence: only listen if close enough  [Deffuant et al., 2000]
@@ -216,6 +232,22 @@ class Voter(Agent):
         # 4) after using the computer, update trust in it              [OWN] Step 5
         if use_computer:
             self.update_computer_trust(accepted)
+
+        # 5) update party preference: closest party to the new opinion  [OWN] Step 8
+        self.party = party_of(self.opinion, params.party_positions)
+
+    def human_message(self, partner):
+        """What a neighbour says: their opinion + Gaussian noise.   [OWN] Step 7
+
+        The noise stands for imperfect communication (people do not state
+        their opinion exactly). Clipped so the message stays in [0, 1].
+        (The `sigma > 0` check means no random number is drawn when sigma = 0,
+        so sigma = 0 gives exactly the same run as before Step 7.)
+        """
+        sigma = self.model.params.sigma
+        if sigma > 0:
+            return clip01(partner.opinion + self.model.random.gauss(0, sigma))
+        return partner.opinion
 
     def update_computer_trust(self, accepted):
         """Trust goes up a little after accepting the computer's message and
@@ -270,6 +302,21 @@ class VoterModel(Model):
     def computer_trusts(self):
         return np.array([a.computer_trust for a in self.voter_list])
 
+    def parties(self):
+        return np.array([a.party for a in self.voter_list])
+
+    def initial_parties(self):
+        return np.array([a.initial_party for a in self.voter_list])
+
+    def party_shares(self):
+        """Vote share of each party (fractions that add up to 1)."""
+        counts = np.bincount(self.parties(), minlength=len(self.params.party_positions))
+        return counts / len(self.voter_list)
+
+    def share_switched(self):
+        """Main outcome: proportion of voters whose party differs from the start."""
+        return float(np.mean(self.parties() != self.initial_parties()))
+
 
 # =============================================================================
 # TESTS / QUICK CHECKS
@@ -315,15 +362,16 @@ def test_deffuant_clusters():
 
 def test_step3():
     """Step 3 tests: network, one interaction by hand, bounds, clusters. [OWN]"""
-    print("\nStep 3 test – small-world network, receiver-only update")
+    print("\nStep 3 test – small-world network, receiver-only update (sigma = 0)")
+    base = replace(PARAMS, sigma=0.0)        # no noise yet: that is Step 7
 
     # 1) network has the right shape
-    model = VoterModel(PARAMS)
+    model = VoterModel(base)
     degrees = [d for _, d in model.network.degree()]
     print(f"Network: {model.network.number_of_nodes()} voters, "
           f"mean degree {np.mean(degrees):.1f}, min degree {min(degrees)}, "
           f"connected: {nx.is_connected(model.network)}")
-    assert np.mean(degrees) == PARAMS.mean_degree
+    assert np.mean(degrees) == base.mean_degree
 
     # 2) one interaction checked by hand
     #    x_i = 0.40, x_j = 0.45, s_i = 0.8, tau_h = 0.5, e = 0.2
@@ -342,13 +390,19 @@ def test_step3():
           "no update when too far apart).")
 
     # 3) opinions stay in [0, 1] (checked every tick inside run())
-    #    + clusters on small-world vs complete network
-    print(f"{'e':>5} | {'small-world clusters':<22} | complete-network clusters")
+    #    + clusters on small-world vs complete network.
+    #    Deffuant verification (proposal): p = 0, sigma = 0, complete network,
+    #    and s = 1 for everyone, so that s * tau_h = 0.5 = Deffuant's mu.
+    #    (Fix suggested by Role 2: with s ~ U(0.2, 1) the average step is
+    #    smaller than Deffuant's, so the comparison was not fair.)
+    print(f"{'e':>5} | {'small-world clusters':<22} | complete network, s=1 (= Deffuant)")
     for e in (0.1, 0.2, 0.3):
         sw, cp = [], []
         for seed in range(5):
             for net, out in (("small_world", sw), ("complete", cp)):
-                params = replace(PARAMS, e=e, seed=seed, network_type=net)
+                params = replace(base, e=e, seed=seed, network_type=net)
+                if net == "complete":
+                    params = replace(params, s_min=1.0, s_max=1.0)
                 x = run(VoterModel(params), params.T).opinions()
                 out.append(count_clusters(x, params.cluster_gap,
                                           params.min_cluster_size))
@@ -356,7 +410,7 @@ def test_step3():
     print("Opinions stayed in [0, 1] in every tick of every run.")
 
     # 4) is T = 200 long enough? how much do opinions still move at the end?
-    params = replace(PARAMS, e=0.2)
+    params = replace(base, e=0.2)
     model = VoterModel(params)
     run(model, params.T - 10)
     before = model.opinions()
@@ -372,10 +426,11 @@ def test_step4():
     # 1) with p = 0 the result must be EXACTLY the same as in Step 3.
     #    Reference values: sum of all final opinions, produced by the Step 3
     #    code (commit c260756) with default parameters and seeds 0, 1, 2.
+    #    (sigma = 0 because Step 3 had no noise yet.)
     step3_reference = {0: 249.6097507906078, 1: 258.30506738389084,
                        2: 254.33135948572186}
     for seed, expected in step3_reference.items():
-        params = replace(PARAMS, seed=seed, p=0.0)
+        params = replace(PARAMS, seed=seed, p=0.0, sigma=0.0)
         got = float(run(VoterModel(params), params.T).opinions().sum())
         assert got == expected, f"seed {seed}: p=0 differs from Step 3!"
     print("p = 0 gives exactly the Step 3 results (seeds 0, 1, 2).")
@@ -485,9 +540,91 @@ def test_step6():
     print("With bias the median voter ends clearly higher (the mean barely moves).")
 
 
+def test_step7():
+    """Step 7 tests: noisy human messages.                           [OWN]"""
+    print("\nStep 7 test – noise on human messages")
+    model = VoterModel(PARAMS)                       # default sigma = 0.05
+    i, j = model.voter_list[0], model.voter_list[1]
+
+    # 1) a neighbour at 0.5: messages should average 0.5 with SD ~ sigma
+    j.opinion = 0.5
+    msgs = np.array([i.human_message(j) for _ in range(20000)])
+    print(f"Partner at 0.50: message mean {msgs.mean():.3f}, SD {msgs.std():.3f} "
+          f"(expected 0.500, {PARAMS.sigma})")
+    assert abs(msgs.mean() - 0.5) < 0.005 and abs(msgs.std() - PARAMS.sigma) < 0.005
+
+    # 2) a neighbour at 0.99: noise may not push the message above 1
+    j.opinion = 0.99
+    msgs = np.array([i.human_message(j) for _ in range(20000)])
+    assert msgs.max() <= 1.0 and msgs.min() >= 0.0
+    print(f"Partner at 0.99: highest message {msgs.max():.3f} (clipped at 1).")
+
+    # 3) sigma = 0: message is exactly the opinion
+    model0 = VoterModel(replace(PARAMS, sigma=0.0))
+    model0.voter_list[1].opinion = 0.42
+    assert model0.voter_list[0].human_message(model0.voter_list[1]) == 0.42
+
+    # 4) effect on whole runs (p = 0, small-world, seeds 0-4)
+    print(f"{'e':>5} | {'sigma':>5} | {'opinion SD':>10} | {'change last 10 ticks':>20}")
+    for e in (0.1, 0.2, 0.3):
+        for sigma in (0.0, 0.05):
+            sds, changes = [], []
+            for seed in range(5):
+                params = replace(PARAMS, e=e, sigma=sigma, seed=seed)
+                model = VoterModel(params)
+                run(model, params.T - 10)
+                before = model.opinions()
+                x = run(model, 10).opinions()
+                sds.append(x.std())
+                changes.append(np.mean(np.abs(x - before)))
+            print(f"{e:>5} | {sigma:>5} | {np.mean(sds):>10.3f} | {np.mean(changes):>20.5f}")
+    print("Opinions stayed in [0, 1] with noise.")
+
+
+def test_step8():
+    """Step 8 tests: parties and party switching.                    [OWN]"""
+    print("\nStep 8 test – four parties")
+    pos = PARAMS.party_positions
+
+    # 1) hand checks of the closest-party rule
+    assert party_of(0.10, pos) == 0
+    assert party_of(0.30, pos) == 1
+    assert party_of(0.60, pos) == 2
+    assert party_of(0.90, pos) == 3
+    assert party_of(0.25, pos) == 0     # exact tie -> lower party
+    assert party_of(0.0, pos) == 0 and party_of(1.0, pos) == 3
+    print("Closest-party rule passed (0.10->0, 0.30->1, 0.60->2, 0.90->3, tie 0.25->0).")
+
+    # 2) at the start ~25% per party (uniform opinions), nobody has switched
+    model = VoterModel(PARAMS)
+    print(f"Start shares: {np.round(model.party_shares(), 3)}  "
+          f"switched: {model.share_switched():.3f}")
+    assert model.share_switched() == 0.0
+
+    # 3) party always matches the current opinion during a run
+    for _ in range(20):
+        model.step()
+        expected = [party_of(x, pos) for x in model.opinions()]
+        assert list(model.parties()) == expected
+
+    # 4) switching in a few conditions (e = 0.2, seeds 0-4)
+    print(f"{'p':>4} | {'b':>5} | {'switched':>8} | final shares (left .. right)")
+    for p, b in ((0.0, 0.0), (1.0, 0.0), (1.0, 0.15)):
+        switched, shares = [], []
+        for seed in range(5):
+            params = replace(PARAMS, p=p, b=b, e=0.2, seed=seed)
+            model = run(VoterModel(params), params.T)
+            switched.append(model.share_switched())
+            shares.append(model.party_shares())
+        print(f"{p:>4} | {b:>5} | {np.mean(switched):>8.3f} | "
+              f"{np.round(np.mean(shares, axis=0), 3)}")
+
+
 if __name__ == "__main__":
     test_deffuant_clusters()
     test_step3()
     test_step4()
     test_step5()
     test_step6()
+    test_step7()
+    test_step8()
