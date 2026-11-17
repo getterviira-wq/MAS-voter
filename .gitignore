@@ -7,3 +7,6 @@ __pycache__/
 
 # macOS folder info files
 .DS_Store
+
+# output of the quick pipeline check (python project-assignment-group-20.py quick)
+results/quick/

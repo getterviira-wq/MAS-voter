@@ -17,14 +17,27 @@ Build status:
     Step 6 – computer bias b                      DONE
     Step 7 – noise sigma on human messages        DONE
     Step 8 – four parties + initial party         DONE
-    Steps 9–11 – output, experiment, switches: TODO
+    Step 9 – data output (4 files)                DONE
+    Step 10 – experiment runner (all CPU cores)   DONE
+    Step 11 – optional switches (bimodal: Role 4): TODO
+
+How to run:
+    python project-assignment-group-20.py             full experiment -> results/
+    python project-assignment-group-20.py quick       small fast check -> results/quick/
+    python project-assignment-group-20.py pilot       T = 1000 pilot to choose T -> results/pilot_T1000/
+    python project-assignment-group-20.py test        all verification tests
 """
 
 import os
-from dataclasses import dataclass, replace
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, replace
+from multiprocessing import Pool
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 from mesa import Agent, Model
 
 
@@ -78,6 +91,32 @@ class Params:
 
 
 PARAMS = Params()
+
+
+@dataclass(frozen=True)
+class Experiment:
+    """Settings of the full experiment (Steps 9–10).                    [OWN]
+
+    p = 0 means the computer is never used, so tau_c0 and b do not matter:
+    then only e is varied -> 3 + 2 x 3 x 3 x 2 = 39 conditions.
+    """
+    p_values: tuple = (0.0, 0.5, 1.0)
+    tau_c0_values: tuple = (0.25, 0.5, 0.75)
+    e_values: tuple = (0.1, 0.2, 0.3)
+    b_values: tuple = (0.0, 0.15)
+    seeds: tuple = tuple(range(30))   # same seeds 0–29 in every condition
+    record_every: int = 10            # per-tick summaries saved every 10 ticks (+ last tick)
+    last_ticks: int = 10              # party shares are also averaged over the last 10 ticks
+    # runs saved in full (every voter, every recorded tick), for plots:
+    # (p, tau_c0, e, b), all with seed `example_seed`
+    example_conditions: tuple = ((0.5, 0.5, 0.2, 0.0),
+                                 (0.5, 0.5, 0.2, 0.15),
+                                 (0.5, 0.5, 0.3, 0.15))
+    example_seed: int = 0
+    out_dir: str = "results"
+
+
+EXPERIMENT = Experiment()
 
 
 # =============================================================================
@@ -187,6 +226,16 @@ def party_of(opinion, positions):
     return distances.index(min(distances))
 
 
+def initial_opinion(model):
+    """Starting opinion of one voter: x_i ~ U(0, 1).     [Deffuant et al., 2000]
+
+    This is the single place where starting opinions are made, so an
+    alternative start (e.g. the bimodal option, Role 4) only needs an
+    `if` here plus a setting in Params.
+    """
+    return model.random.random()
+
+
 class Voter(Agent):
     """A voter in our extended model."""
 
@@ -194,8 +243,7 @@ class Voter(Agent):
         super().__init__(model)                     # [Mesa]
         params = model.params
         self.node = node                            # position in the network
-        # initial opinion x_i ~ U(0, 1)              # [Deffuant et al., 2000]
-        self.opinion = model.random.random()
+        self.opinion = initial_opinion(model)
         # fixed susceptibility s_i ~ U(s_min, s_max) # [OWN]
         self.susceptibility = model.random.uniform(params.s_min, params.s_max)
         # personal computer trust, starts at tau_c0  # [OWN] Step 5
@@ -316,6 +364,187 @@ class VoterModel(Model):
     def share_switched(self):
         """Main outcome: proportion of voters whose party differs from the start."""
         return float(np.mean(self.parties() != self.initial_parties()))
+
+    def measures(self):
+        """Summary of the whole population right now (one row of ticks.csv). [OWN]"""
+        x = self.opinions()
+        row = dict(tick=self.steps,                 # [Mesa] counts calls to step()
+                   mean_opinion=x.mean(),
+                   median_opinion=float(np.median(x)),
+                   var_opinion=x.var(),
+                   clusters=count_clusters(x, self.params.cluster_gap,
+                                           self.params.min_cluster_size),
+                   share_switched=self.share_switched(),
+                   mean_trust=self.computer_trusts().mean())
+        for k, share in enumerate(self.party_shares()):
+            row[f"share_party{k}"] = share
+        return row
+
+
+# =============================================================================
+# STEP 9 – DATA OUTPUT                                                   [OWN]
+# =============================================================================
+# One run produces up to four tables (see Experiment for the settings):
+#   runs     – 1 row per run: all parameters + all final measures (main analysis)
+#   ticks    – 1 row per recorded tick per run: summary measures over time
+#   voters   – 1 row per voter per run, at the end (e.g. trust vs opinion)
+#   examples – 1 row per voter per recorded tick, only for a few example runs
+# Every row carries condition_id and seed, so tables can be joined.
+
+def code_version():
+    """Git commit of the code that produced the data (for traceability)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here,
+                                capture_output=True, text=True).stdout.strip()
+        changed = subprocess.run(["git", "status", "--porcelain", "--",
+                                  os.path.basename(__file__)], cwd=here,
+                                 capture_output=True, text=True).stdout.strip()
+        return (commit + "+uncommitted" if changed else commit) or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def voter_table(model):
+    """Every voter's current state as a table."""
+    return pd.DataFrame(dict(voter_id=[v.node for v in model.voter_list],
+                             opinion=model.opinions(),
+                             party=model.parties(),
+                             trust=model.computer_trusts()))
+
+
+def run_one(params, condition_id=0, exp=EXPERIMENT, keep_example=False):
+    """Run one simulation and return its output tables.                [OWN]"""
+    start_time = time.time()
+    model = VoterModel(params)
+    x_start = model.opinions().copy()
+    shares_start = model.party_shares()
+
+    ticks = [model.measures()]                       # tick 0 = start
+    examples = [voter_table(model).assign(tick=0)] if keep_example else []
+    last_shares = []
+    for t in range(1, params.T + 1):
+        model.step()
+        if t % exp.record_every == 0 or t == params.T:
+            ticks.append(model.measures())
+            if keep_example:
+                examples.append(voter_table(model).assign(tick=t))
+        if t > params.T - exp.last_ticks:
+            last_shares.append(model.party_shares())
+
+    x_end = model.opinions()
+    shares_end = model.party_shares()
+    shares_last = np.mean(last_shares, axis=0)
+    trust = model.computer_trusts()
+    ids = dict(condition_id=condition_id, seed=params.seed)
+
+    # --- runs: one row with all parameters and final measures ---
+    run_row = dict(ids, **{k: (str(v) if isinstance(v, tuple) else v)
+                           for k, v in asdict(params).items() if k != "seed"})
+    run_row.update(
+        share_switched=model.share_switched(),
+        # how much the vote shares changed in total (0 = same, 1 = completely)
+        net_vote_shift=0.5 * np.abs(shares_end - shares_start).sum(),
+        mean_abs_opinion_change=np.abs(x_end - x_start).mean(),
+        mean_opinion=x_end.mean(),
+        median_opinion=float(np.median(x_end)),
+        median_shift=float(np.median(x_end) - np.median(x_start)),
+        var_opinion=x_end.var(),
+        clusters=count_clusters(x_end, params.cluster_gap, params.min_cluster_size),
+        mean_trust=trust.mean(),
+        share_trust_0=np.mean(trust == 0.0),     # voters who fully distrust the computer
+        share_trust_1=np.mean(trust == 1.0),     # voters who fully trust it
+    )
+    for k in range(len(params.party_positions)):
+        run_row[f"share_party{k}_start"] = shares_start[k]
+        run_row[f"share_party{k}_end"] = shares_end[k]
+        run_row[f"share_party{k}_last{exp.last_ticks}"] = shares_last[k]
+    run_row["runtime_s"] = round(time.time() - start_time, 2)
+
+    # --- ticks: summary over time ---
+    ticks_df = pd.DataFrame(ticks).assign(**ids)
+
+    # --- voters: final state of every voter ---
+    key = dict(ids, p=params.p, tau_c0=params.tau_c0, e=params.e, b=params.b)
+    voters_df = pd.DataFrame(dict(
+        voter_id=[v.node for v in model.voter_list],
+        degree=[len(v.neighbours) for v in model.voter_list],
+        susceptibility=[v.susceptibility for v in model.voter_list],
+        opinion_start=x_start, opinion_end=x_end,
+        party_start=model.initial_parties(), party_end=model.parties(),
+        trust_end=trust)).assign(**key)
+
+    examples_df = (pd.concat(examples).assign(**key) if keep_example else None)
+    return dict(run=run_row, ticks=ticks_df, voters=voters_df, examples=examples_df)
+
+
+# =============================================================================
+# STEP 10 – EXPERIMENT RUNNER                                            [OWN]
+# =============================================================================
+
+def make_conditions(base=PARAMS, exp=EXPERIMENT):
+    """All conditions as a list of Params (seed still to be filled in).
+
+    With p = 0 the computer is never used, so only e varies there.
+    Default: 3 + 2 x 3 x 3 x 2 = 39 conditions.
+    """
+    conditions = []
+    for p in exp.p_values:
+        if p == 0:
+            for e in exp.e_values:
+                conditions.append(replace(base, p=0.0, e=e))
+        else:
+            for tau_c0 in exp.tau_c0_values:
+                for e in exp.e_values:
+                    for b in exp.b_values:
+                        conditions.append(replace(base, p=p, tau_c0=tau_c0, e=e, b=b))
+    return conditions
+
+
+def _job(args):
+    """One (condition, seed) job; must be a top-level function for Pool."""
+    params, condition_id, exp = args
+    is_example = (params.seed == exp.example_seed and
+                  (params.p, params.tau_c0, params.e, params.b) in exp.example_conditions)
+    return run_one(params, condition_id, exp, keep_example=is_example)
+
+
+def run_experiment(base=PARAMS, exp=EXPERIMENT, processes=None):
+    """Run every condition with every seed, in parallel, and save 4 files."""
+    conditions = make_conditions(base, exp)
+    jobs = [(replace(cond, seed=seed), cid, exp)
+            for cid, cond in enumerate(conditions) for seed in exp.seeds]
+    version = code_version()
+    print(f"{len(conditions)} conditions x {len(exp.seeds)} seeds = {len(jobs)} runs, "
+          f"T = {base.T}, code version {version}")
+
+    start = time.time()
+    results = []
+    with Pool(processes or os.cpu_count()) as pool:     # one run per CPU core at a time
+        for i, res in enumerate(pool.imap_unordered(_job, jobs), start=1):
+            results.append(res)
+            if i % 50 == 0 or i == len(jobs):
+                print(f"  {i}/{len(jobs)} runs done ({time.time() - start:.0f} s)",
+                      flush=True)                # show progress immediately
+
+    order = ["condition_id", "seed"]
+    runs = pd.DataFrame([r["run"] for r in results]).assign(code_version=version)
+    runs = runs.sort_values(order).reset_index(drop=True)
+    ticks = pd.concat([r["ticks"] for r in results]).sort_values(order + ["tick"])
+    voters = pd.concat([r["voters"] for r in results]).sort_values(order + ["voter_id"])
+    examples = [r["examples"] for r in results if r["examples"] is not None]
+
+    os.makedirs(exp.out_dir, exist_ok=True)
+    runs.to_csv(os.path.join(exp.out_dir, "runs.csv"), index=False)
+    ticks.to_csv(os.path.join(exp.out_dir, "ticks.csv"), index=False)
+    # voters is big (~585k rows): compressed; pandas reads it with pd.read_csv as usual
+    voters.to_csv(os.path.join(exp.out_dir, "voters.csv.gz"), index=False)
+    if examples:
+        pd.concat(examples).sort_values(order + ["tick", "voter_id"]).to_csv(
+            os.path.join(exp.out_dir, "examples.csv"), index=False)
+    print(f"Saved runs.csv, ticks.csv, voters.csv.gz, examples.csv to {exp.out_dir}/ "
+          f"in {time.time() - start:.0f} s")
+    return runs
 
 
 # =============================================================================
@@ -620,7 +849,53 @@ def test_step8():
               f"{np.round(np.mean(shares, axis=0), 3)}")
 
 
-if __name__ == "__main__":
+def test_step9_10():
+    """Steps 9–10 tests: output tables, conditions, paired seeds.    [OWN]"""
+    print("\nStep 9–10 test – data output and experiment runner")
+
+    # 1) 39 conditions, as in the proposal
+    conditions = make_conditions()
+    assert len(conditions) == 39
+    assert sum(c.p == 0 for c in conditions) == 3
+    print(f"make_conditions: {len(conditions)} conditions (3 with p = 0).")
+
+    # 2) one short run: tables have the right size and sensible values
+    params = replace(PARAMS, p=0.5, b=0.15, T=30, seed=3)
+    out = run_one(params, condition_id=7, keep_example=True)
+    r, ticks, voters, ex = out["run"], out["ticks"], out["voters"], out["examples"]
+    shares = [r[f"share_party{k}_end"] for k in range(4)]
+    assert np.isclose(sum(shares), 1.0)
+    assert list(ticks["tick"]) == [0, 10, 20, 30]           # record_every = 10
+    assert len(voters) == params.N and len(ex) == params.N * 4
+    assert 0 <= r["share_switched"] <= 1 and 0 <= r["net_vote_shift"] <= 1
+    assert r["condition_id"] == 7 and r["seed"] == 3 and r["b"] == 0.15
+    # numbers in the tables agree with each other
+    assert np.isclose(ticks["share_switched"].iloc[-1], r["share_switched"])
+    assert np.isclose(np.mean(voters["party_end"] != voters["party_start"]),
+                      r["share_switched"])
+    print("run_one: table sizes and values consistent (shares sum to 1, "
+          "ticks/voters/runs agree).")
+
+    # 3) paired design: same seed and p -> identical random draws for any b
+    #    (so 'b = 0.15 minus b = 0' compares like with like)
+    states = []
+    for b in (0.0, 0.15):
+        model = VoterModel(replace(PARAMS, p=0.5, b=b, T=30, seed=3))
+        run(model, 30)
+        states.append(model.random.getstate())
+    assert states[0] == states[1]
+    print("Paired seeds: b = 0 and b = 0.15 use exactly the same random draws.")
+
+    # 4) running in parallel gives exactly the same result as running directly
+    exp = replace(EXPERIMENT, example_conditions=())
+    with Pool(2) as pool:
+        par = pool.map(_job, [(params, 7, exp)])[0]["run"]
+    direct = run_one(params, 7, exp)["run"]
+    assert all(par[k] == direct[k] for k in par if k != "runtime_s")
+    print("Parallel run identical to direct run.")
+
+
+def run_all_tests():
     test_deffuant_clusters()
     test_step3()
     test_step4()
@@ -628,3 +903,27 @@ if __name__ == "__main__":
     test_step6()
     test_step7()
     test_step8()
+    test_step9_10()
+    print("\nAll tests passed.")
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "experiment"
+    if mode == "test":
+        run_all_tests()
+    elif mode == "quick":
+        # fast check of the whole pipeline: 2 seeds, 50 ticks, separate folder
+        run_experiment(replace(PARAMS, T=50),
+                       replace(EXPERIMENT, seeds=(0, 1),
+                               out_dir=os.path.join("results", "quick")))
+    elif mode == "pilot":
+        # pilot to CHOOSE the run length T (Role 2's "settled" rule): full grid,
+        # T = 1000, separate folder. Because seeds are identical, tick t of this
+        # pilot equals tick t of a shorter run, so any T <= 1000 can be judged.
+        run_experiment(replace(PARAMS, T=1000),
+                       replace(EXPERIMENT, out_dir=os.path.join("results", "pilot_T1000")))
+    elif mode == "experiment":
+        run_experiment()
+    else:
+        print("Use: python project-assignment-group-20.py "
+              "[experiment | quick | pilot | test]")
