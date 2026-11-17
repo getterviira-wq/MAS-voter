@@ -54,7 +54,8 @@ class Params:
     # --- general ---
     seed: int = 0              # random seed -> same seed gives exactly the same run
     N: int = 500               # number of voters
-    T: int = 200               # number of ticks (one tick = every voter acts once)
+    T: int = 1000              # number of ticks (one tick = every voter acts once);
+                               # 200 in the proposal, raised after the pilot (see report)
 
     # --- Deffuant core ---
     e: float = 0.2             # confidence threshold: only listen if |m - x_i| <= e
@@ -551,6 +552,9 @@ def run_experiment(base=PARAMS, exp=EXPERIMENT, processes=None):
 # TESTS / QUICK CHECKS
 # =============================================================================
 
+# Tests use T = 200: fast, and the Step 3 reference values were made with T = 200.
+TEST_PARAMS = replace(PARAMS, T=200)
+
 def run(model, T):
     """Run T ticks; check after every tick that opinions stay in [0, 1]."""
     for _ in range(T):
@@ -570,7 +574,7 @@ def test_deffuant_clusters():
     for e in (0.1, 0.2, 0.3):
         counts = []
         for seed in range(5):
-            params = replace(PARAMS, e=e, seed=seed)
+            params = replace(TEST_PARAMS, e=e, seed=seed)
             model = DeffuantModel(params)
             for _ in range(params.T):
                 model.step()
@@ -582,7 +586,7 @@ def test_deffuant_clusters():
         print(f"{e:>5} | {counts}")
 
     # reproducibility check: same seed -> identical result
-    a = DeffuantModel(PARAMS); b = DeffuantModel(PARAMS)
+    a = DeffuantModel(TEST_PARAMS); b = DeffuantModel(TEST_PARAMS)
     for _ in range(10):
         a.step(); b.step()
     assert np.array_equal(a.opinions(), b.opinions()), "seed not reproducible!"
@@ -592,7 +596,7 @@ def test_deffuant_clusters():
 def test_step3():
     """Step 3 tests: network, one interaction by hand, bounds, clusters. [OWN]"""
     print("\nStep 3 test – small-world network, receiver-only update (sigma = 0)")
-    base = replace(PARAMS, sigma=0.0)        # no noise yet: that is Step 7
+    base = replace(TEST_PARAMS, sigma=0.0)        # no noise yet: that is Step 7
 
     # 1) network has the right shape
     model = VoterModel(base)
@@ -659,17 +663,17 @@ def test_step4():
     step3_reference = {0: 249.6097507906078, 1: 258.30506738389084,
                        2: 254.33135948572186}
     for seed, expected in step3_reference.items():
-        params = replace(PARAMS, seed=seed, p=0.0, sigma=0.0)
+        params = replace(TEST_PARAMS, seed=seed, p=0.0, sigma=0.0)
         got = float(run(VoterModel(params), params.T).opinions().sum())
         assert got == expected, f"seed {seed}: p=0 differs from Step 3!"
     print("p = 0 gives exactly the Step 3 results (seeds 0, 1, 2).")
 
     # 2) computer summary checked by hand
-    model = VoterModel(replace(PARAMS, b=0.0))
+    model = VoterModel(replace(TEST_PARAMS, b=0.0))
     for v in model.voter_list:
         v.opinion = 0.3
     assert np.isclose(model.computer.consult(), 0.3)  # mean of 0.3s = 0.3
-    model = VoterModel(replace(PARAMS, b=0.15))
+    model = VoterModel(replace(TEST_PARAMS, b=0.15))
     for v in model.voter_list:
         v.opinion = 0.3
     assert np.isclose(model.computer.consult(), 0.45)  # 0.3 + bias 0.15
@@ -680,7 +684,7 @@ def test_step4():
 
     # 3) opinions stay in [0, 1] when the computer is used
     for p in (0.5, 1.0):
-        run(VoterModel(replace(PARAMS, p=p)), PARAMS.T)
+        run(VoterModel(replace(TEST_PARAMS, p=p)), TEST_PARAMS.T)
     print("Opinions stayed in [0, 1] with p = 0.5 and p = 1.")
 
 
@@ -689,7 +693,7 @@ def test_step5():
     print("\nStep 5 test – dynamic computer trust")
 
     # 1) hand check. Voter: x = 0.40, s = 0.8, computer trust = 0.5, e = 0.2.
-    model = VoterModel(replace(PARAMS, p=1.0))       # p = 1: always the computer
+    model = VoterModel(replace(TEST_PARAMS, p=1.0))       # p = 1: always the computer
     i = model.voter_list[0]
     i.opinion, i.susceptibility, i.computer_trust = 0.40, 0.8, 0.5
     #    computer says 0.45 -> accepted:
@@ -713,7 +717,7 @@ def test_step5():
     matplotlib.use("Agg")                  # save to file, no window
     import matplotlib.pyplot as plt
 
-    params = replace(PARAMS, p=0.5, e=0.2)
+    params = replace(TEST_PARAMS, p=0.5, e=0.2)
     model = VoterModel(params)
     follow = model.voter_list[:3]          # follow three voters
     history = {v.unique_id: [v.computer_trust] for v in follow}
@@ -755,7 +759,7 @@ def test_step6():
     for b in (0.0, 0.15):
         starts, medians, means, trusts = [], [], [], []
         for seed in range(5):
-            params = replace(PARAMS, p=1.0, e=0.2, b=b, seed=seed)
+            params = replace(TEST_PARAMS, p=1.0, e=0.2, b=b, seed=seed)
             model = VoterModel(params)
             starts.append(np.median(model.opinions()))
             x = run(model, params.T).opinions()
@@ -772,15 +776,15 @@ def test_step6():
 def test_step7():
     """Step 7 tests: noisy human messages.                           [OWN]"""
     print("\nStep 7 test – noise on human messages")
-    model = VoterModel(PARAMS)                       # default sigma = 0.05
+    model = VoterModel(TEST_PARAMS)                       # default sigma = 0.05
     i, j = model.voter_list[0], model.voter_list[1]
 
     # 1) a neighbour at 0.5: messages should average 0.5 with SD ~ sigma
     j.opinion = 0.5
     msgs = np.array([i.human_message(j) for _ in range(20000)])
     print(f"Partner at 0.50: message mean {msgs.mean():.3f}, SD {msgs.std():.3f} "
-          f"(expected 0.500, {PARAMS.sigma})")
-    assert abs(msgs.mean() - 0.5) < 0.005 and abs(msgs.std() - PARAMS.sigma) < 0.005
+          f"(expected 0.500, {TEST_PARAMS.sigma})")
+    assert abs(msgs.mean() - 0.5) < 0.005 and abs(msgs.std() - TEST_PARAMS.sigma) < 0.005
 
     # 2) a neighbour at 0.99: noise may not push the message above 1
     j.opinion = 0.99
@@ -789,7 +793,7 @@ def test_step7():
     print(f"Partner at 0.99: highest message {msgs.max():.3f} (clipped at 1).")
 
     # 3) sigma = 0: message is exactly the opinion
-    model0 = VoterModel(replace(PARAMS, sigma=0.0))
+    model0 = VoterModel(replace(TEST_PARAMS, sigma=0.0))
     model0.voter_list[1].opinion = 0.42
     assert model0.voter_list[0].human_message(model0.voter_list[1]) == 0.42
 
@@ -799,7 +803,7 @@ def test_step7():
         for sigma in (0.0, 0.05):
             sds, changes = [], []
             for seed in range(5):
-                params = replace(PARAMS, e=e, sigma=sigma, seed=seed)
+                params = replace(TEST_PARAMS, e=e, sigma=sigma, seed=seed)
                 model = VoterModel(params)
                 run(model, params.T - 10)
                 before = model.opinions()
@@ -813,7 +817,7 @@ def test_step7():
 def test_step8():
     """Step 8 tests: parties and party switching.                    [OWN]"""
     print("\nStep 8 test – four parties")
-    pos = PARAMS.party_positions
+    pos = TEST_PARAMS.party_positions
 
     # 1) hand checks of the closest-party rule
     assert party_of(0.10, pos) == 0
@@ -825,7 +829,7 @@ def test_step8():
     print("Closest-party rule passed (0.10->0, 0.30->1, 0.60->2, 0.90->3, tie 0.25->0).")
 
     # 2) at the start ~25% per party (uniform opinions), nobody has switched
-    model = VoterModel(PARAMS)
+    model = VoterModel(TEST_PARAMS)
     print(f"Start shares: {np.round(model.party_shares(), 3)}  "
           f"switched: {model.share_switched():.3f}")
     assert model.share_switched() == 0.0
@@ -841,7 +845,7 @@ def test_step8():
     for p, b in ((0.0, 0.0), (1.0, 0.0), (1.0, 0.15)):
         switched, shares = [], []
         for seed in range(5):
-            params = replace(PARAMS, p=p, b=b, e=0.2, seed=seed)
+            params = replace(TEST_PARAMS, p=p, b=b, e=0.2, seed=seed)
             model = run(VoterModel(params), params.T)
             switched.append(model.share_switched())
             shares.append(model.party_shares())
@@ -860,7 +864,7 @@ def test_step9_10():
     print(f"make_conditions: {len(conditions)} conditions (3 with p = 0).")
 
     # 2) one short run: tables have the right size and sensible values
-    params = replace(PARAMS, p=0.5, b=0.15, T=30, seed=3)
+    params = replace(TEST_PARAMS, p=0.5, b=0.15, T=30, seed=3)
     out = run_one(params, condition_id=7, keep_example=True)
     r, ticks, voters, ex = out["run"], out["ticks"], out["voters"], out["examples"]
     shares = [r[f"share_party{k}_end"] for k in range(4)]
@@ -880,7 +884,7 @@ def test_step9_10():
     #    (so 'b = 0.15 minus b = 0' compares like with like)
     states = []
     for b in (0.0, 0.15):
-        model = VoterModel(replace(PARAMS, p=0.5, b=b, T=30, seed=3))
+        model = VoterModel(replace(TEST_PARAMS, p=0.5, b=b, T=30, seed=3))
         run(model, 30)
         states.append(model.random.getstate())
     assert states[0] == states[1]
