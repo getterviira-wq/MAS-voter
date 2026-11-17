@@ -1,0 +1,9 @@
+# Python's automatic cache of compiled code (recreated on every run)
+__pycache__/
+*.pyc
+
+# VS Code editor settings (personal to each computer)
+.vscode/
+
+# macOS folder info files
+.DS_Store

@@ -12,9 +12,13 @@ Build status:
     Step 1 – parameter block                      DONE
     Step 2 – plain Deffuant baseline (two-way)    DONE
     Step 3 – small-world network, receiver-only   DONE
-    Steps 4–11 – computer, trust, bias, noise, parties, output: TODO
+    Step 4 – computer source (p, k)               DONE
+    Step 5 – dynamic computer trust               DONE
+    Step 6 – computer bias b                      DONE
+    Steps 7–11 – noise, parties, output, experiment, switches: TODO
 """
 
+import os
 from dataclasses import dataclass, replace
 
 import networkx as nx
@@ -51,7 +55,7 @@ class Params:
     s_max: float = 1.0
     tau_h: float = 0.5         # fixed trust in humans
 
-    # --- computer source (later: Steps 4–6) ---
+    # --- computer source (Steps 4–6) ---
     p: float = 0.0             # probability of consulting the computer
     k: int = 10                # computer averages k random voters
     tau_c0: float = 0.5        # initial computer trust
@@ -165,34 +169,81 @@ def build_network(params: Params):
     raise ValueError(f"unknown network_type: {params.network_type}")
 
 
+def clip01(value):
+    """Keep a number inside [0, 1]."""
+    return min(max(value, 0.0), 1.0)
+
+
 class Voter(Agent):
     """A voter in our extended model."""
 
     def __init__(self, model, node):
         super().__init__(model)                     # [Mesa]
-        p = model.params
+        params = model.params
         self.node = node                            # position in the network
         # initial opinion x_i ~ U(0, 1)              # [Deffuant et al., 2000]
         self.opinion = model.random.random()
         # fixed susceptibility s_i ~ U(s_min, s_max) # [OWN]
-        self.susceptibility = model.random.uniform(p.s_min, p.s_max)
+        self.susceptibility = model.random.uniform(params.s_min, params.s_max)
+        # personal computer trust, starts at tau_c0  # [OWN] Step 5
+        self.computer_trust = params.tau_c0
         self.neighbours = []                        # filled in by the model
 
     def step(self):
-        p = self.model.params
+        """One action of this voter in a tick (steps 1–4 of the tick in our proposal)."""
+        params = self.model.params
 
-        # ask one random network neighbour j                         [OWN]
-        partner = self.model.random.choice(self.neighbours)
-        message = partner.opinion        # noise sigma is added in Step 7
+        # 1) choose the information source                             [OWN] Step 4
+        #    (the `params.p > 0` check means no random number is drawn when
+        #    p = 0, so p = 0 gives exactly the same run as Step 3)
+        use_computer = params.p > 0 and self.model.random.random() < params.p
 
-        # bounded confidence: only listen if close enough  [Deffuant et al., 2000]
-        if abs(message - self.opinion) <= p.e:
+        # 2) get the message and the trust in its source               [OWN]
+        if use_computer:
+            message = self.model.computer.consult()
+            trust = self.computer_trust              # personal, changes over time
+        else:
+            partner = self.model.random.choice(self.neighbours)
+            message = partner.opinion                # noise sigma is added in Step 7
+            trust = params.tau_h                     # fixed
+
+        # 3) bounded confidence: only listen if close enough  [Deffuant et al., 2000]
+        accepted = abs(message - self.opinion) <= params.e
+        if accepted:
             # receiver-only update, weighted by susceptibility and trust  [OWN]
-            self.opinion += self.susceptibility * p.tau_h * (message - self.opinion)
+            self.opinion += self.susceptibility * trust * (message - self.opinion)
+
+        # 4) after using the computer, update trust in it              [OWN] Step 5
+        if use_computer:
+            self.update_computer_trust(accepted)
+
+    def update_computer_trust(self, accepted):
+        """Trust goes up a little after accepting the computer's message and
+        down more after rejecting it: people lose trust in algorithms faster
+        than they gain it.               [OWN, based on Dietvorst et al., 2015]
+        """
+        params = self.model.params
+        change = params.trust_up if accepted else -params.trust_down
+        self.computer_trust = clip01(self.computer_trust + change)
+
+
+class Computer(Agent):
+    """The computer source (e.g. a search engine or chatbot).       [OWN] Step 4
+
+    It has no opinion of its own. When a voter consults it, it returns the mean
+    opinion of k randomly chosen voters (from the whole population, not just
+    the network), plus a bias b (misinformation, Step 6), kept inside [0, 1].
+    """
+
+    def consult(self):
+        params = self.model.params
+        sample = self.model.random.sample(self.model.voter_list, params.k)
+        summary = np.mean([v.opinion for v in sample])
+        return clip01(summary + params.b)            # bias b: Step 6
 
 
 class VoterModel(Model):
-    """Our extended model. Step 3: network + receiver-only update."""
+    """Our extended model: network, computer source, trust, bias."""
 
     def __init__(self, params: Params):
         super().__init__(rng=params.seed)           # [Mesa]
@@ -206,11 +257,18 @@ class VoterModel(Model):
             voter.neighbours = [self.voter_list[n]
                                 for n in self.network.neighbors(voter.node)]
 
+        # one computer, shared by everyone                             [OWN]
+        self.computer = Computer(self)
+
     def step(self):
-        self.agents.shuffle_do("step")              # [Mesa]
+        # only voters act; the computer just answers when consulted   [Mesa]
+        self.agents_by_type[Voter].shuffle_do("step")
 
     def opinions(self):
         return np.array([a.opinion for a in self.voter_list])
+
+    def computer_trusts(self):
+        return np.array([a.computer_trust for a in self.voter_list])
 
 
 # =============================================================================
@@ -307,6 +365,129 @@ def test_step3():
     print(f"Mean opinion change in the last 10 ticks (e=0.2): {change:.6f}")
 
 
+def test_step4():
+    """Step 4 tests: p = 0 identical to Step 3; computer summary correct. [OWN]"""
+    print("\nStep 4 test – computer source")
+
+    # 1) with p = 0 the result must be EXACTLY the same as in Step 3.
+    #    Reference values: sum of all final opinions, produced by the Step 3
+    #    code (commit c260756) with default parameters and seeds 0, 1, 2.
+    step3_reference = {0: 249.6097507906078, 1: 258.30506738389084,
+                       2: 254.33135948572186}
+    for seed, expected in step3_reference.items():
+        params = replace(PARAMS, seed=seed, p=0.0)
+        got = float(run(VoterModel(params), params.T).opinions().sum())
+        assert got == expected, f"seed {seed}: p=0 differs from Step 3!"
+    print("p = 0 gives exactly the Step 3 results (seeds 0, 1, 2).")
+
+    # 2) computer summary checked by hand
+    model = VoterModel(replace(PARAMS, b=0.0))
+    for v in model.voter_list:
+        v.opinion = 0.3
+    assert np.isclose(model.computer.consult(), 0.3)  # mean of 0.3s = 0.3
+    model = VoterModel(replace(PARAMS, b=0.15))
+    for v in model.voter_list:
+        v.opinion = 0.3
+    assert np.isclose(model.computer.consult(), 0.45)  # 0.3 + bias 0.15
+    for v in model.voter_list:
+        v.opinion = 0.95
+    assert model.computer.consult() == 1.0             # 1.10 clipped to 1
+    print("Computer summary passed (0.3 -> 0.3; +bias -> 0.45; 1.10 clipped to 1.0).")
+
+    # 3) opinions stay in [0, 1] when the computer is used
+    for p in (0.5, 1.0):
+        run(VoterModel(replace(PARAMS, p=p)), PARAMS.T)
+    print("Opinions stayed in [0, 1] with p = 0.5 and p = 1.")
+
+
+def test_step5():
+    """Step 5 tests: trust update by hand; plot one voter's trust.    [OWN]"""
+    print("\nStep 5 test – dynamic computer trust")
+
+    # 1) hand check. Voter: x = 0.40, s = 0.8, computer trust = 0.5, e = 0.2.
+    model = VoterModel(replace(PARAMS, p=1.0))       # p = 1: always the computer
+    i = model.voter_list[0]
+    i.opinion, i.susceptibility, i.computer_trust = 0.40, 0.8, 0.5
+    #    computer says 0.45 -> accepted:
+    #    x = 0.40 + 0.8 * 0.5 * 0.05 = 0.42, trust = 0.5 + 0.02 = 0.52
+    model.computer.consult = lambda: 0.45
+    i.step()
+    assert np.isclose(i.opinion, 0.42) and np.isclose(i.computer_trust, 0.52)
+    #    computer says 0.90 -> rejected: x stays 0.42, trust = 0.52 - 0.05 = 0.47
+    model.computer.consult = lambda: 0.90
+    i.step()
+    assert np.isclose(i.opinion, 0.42) and np.isclose(i.computer_trust, 0.47)
+    #    trust never goes below 0
+    i.computer_trust = 0.03
+    i.step()
+    assert i.computer_trust == 0.0
+    print("Hand-checked trust update passed (accept: 0.50 -> 0.52, "
+          "reject: 0.52 -> 0.47, floor at 0).")
+
+    # 2) follow trust over time and save a plot
+    import matplotlib
+    matplotlib.use("Agg")                  # save to file, no window
+    import matplotlib.pyplot as plt
+
+    params = replace(PARAMS, p=0.5, e=0.2)
+    model = VoterModel(params)
+    follow = model.voter_list[:3]          # follow three voters
+    history = {v.unique_id: [v.computer_trust] for v in follow}
+    mean_trust = [model.computer_trusts().mean()]
+    for _ in range(params.T):
+        model.step()
+        for v in follow:
+            history[v.unique_id].append(v.computer_trust)
+        mean_trust.append(model.computer_trusts().mean())
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for v in follow:
+        ax.plot(history[v.unique_id],
+                label=f"voter {v.unique_id} (final opinion {v.opinion:.2f})")
+    ax.plot(mean_trust, "k--", label="mean of all voters")
+    ax.set(xlabel="tick", ylabel="computer trust", ylim=(-0.02, 1.02),
+           title=f"Computer trust over time (p={params.p}, e={params.e}, b={params.b})")
+    ax.legend()
+    os.makedirs("results", exist_ok=True)
+    fig.savefig("results/test_step5_trust.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Mean computer trust: start {mean_trust[0]:.2f}, "
+          f"end {mean_trust[-1]:.2f}. Plot saved to results/test_step5_trust.png")
+
+
+def test_step6():
+    """Step 6 test: b = 0.15, p = 1 -> the bulk of opinions moves up. [OWN]
+
+    Note: we first planned to test the MEAN opinion, but the mean hardly moves.
+    Voters on both sides of the biased message are pulled towards it, while
+    voters far below it reject it and stay behind. So the majority moves up
+    and a minority is left behind, and the average stays about the same.
+    The MEDIAN (the middle voter) shows the shift, so we test that.
+    """
+    print("\nStep 6 test – computer bias (p = 1, e = 0.2, seeds 0-4)")
+    print(f"{'b':>5} | {'start median':>12} | {'end median':>10} | "
+          f"{'end mean':>8} | {'end mean trust':>14}")
+    end_medians = {}
+    for b in (0.0, 0.15):
+        starts, medians, means, trusts = [], [], [], []
+        for seed in range(5):
+            params = replace(PARAMS, p=1.0, e=0.2, b=b, seed=seed)
+            model = VoterModel(params)
+            starts.append(np.median(model.opinions()))
+            x = run(model, params.T).opinions()
+            medians.append(np.median(x))
+            means.append(x.mean())
+            trusts.append(model.computer_trusts().mean())
+        end_medians[b] = np.mean(medians)
+        print(f"{b:>5} | {np.mean(starts):>12.3f} | {np.mean(medians):>10.3f} | "
+              f"{np.mean(means):>8.3f} | {np.mean(trusts):>14.3f}")
+    assert end_medians[0.15] > end_medians[0.0] + 0.05, "bias did not move opinions up!"
+    print("With bias the median voter ends clearly higher (the mean barely moves).")
+
+
 if __name__ == "__main__":
     test_deffuant_clusters()
     test_step3()
+    test_step4()
+    test_step5()
+    test_step6()
