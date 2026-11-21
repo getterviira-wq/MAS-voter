@@ -53,6 +53,15 @@ def test_cluster_counter():
     x = np.r_[np.full(100, 0.1), np.full(100, 0.5), np.full(10, 0.9)]  # last group too small
     assert count_clusters(x, 0.05, 25) == 2
 
+def test_party_ties_go_to_lower_party():
+    pos = P.party_positions
+    assert [m.party_of(x, pos) for x in (0.0, 0.24, 0.25, 0.26, 0.5, 0.74, 0.75, 1.0)] == [0, 0, 0, 1, 1, 2, 2, 3]
+
+def test_vote_shares_add_up_to_1():
+    model = VoterModel(replace(P, p=0.5, e=0.2))
+    run(model, 20)
+    assert abs(model.party_shares().sum() - 1) < 1e-12
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):
