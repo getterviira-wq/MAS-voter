@@ -3,9 +3,10 @@ Group 20 – MAS project
 Voter Behaviour Change Based on the Information Source:
 Human–Human versus Human–Computer, and the Role of Misinformation
 
-Annotation convention (for Appendix 1):
+Annotation convention(for Appendix 1):
     # [Deffuant et al., 2000]  -> rule taken from the original bounded-confidence model
     # [Mesa]                   -> standard Mesa 3.x usage pattern (Mesa documentation)
+    # [NetworkX]               -> NetworkX implementation of the Watts–Strogatz (1998) small-world graph 
     # [OWN]                    -> our own contribution / design choice
 
 Build status:
