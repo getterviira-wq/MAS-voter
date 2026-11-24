@@ -70,7 +70,7 @@ class Params:
     # --- initial opinions (Step 11, extension, Teacher feedback point 1) ---
     initial_dist: str = "uniform"      # "uniform" (main experiment) or "bimodal" (extension)
     # PLACEHOLDER values: Role 4 chooses the final ones from the literature
-    bimodal_peaks: tuple = (0.35, 0.65)  # centre-left and centre-right peak
+    bimodal_peaks: tuple = (0.30, 0.70)  # centre-left and centre-right peak
     bimodal_sd: float = 0.1            # spread around each peak
 
     # --- voters (Step 3; computer trust from Step 5) ---
